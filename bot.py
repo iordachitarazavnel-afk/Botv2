@@ -1879,13 +1879,20 @@ class DecompilerBot:
             work_dir, class_files = FileHandler.prepare_input(input_path)
             obf_analysis = ObfuscationDetector().analyze(class_files, work_dir)
             deobf_dir, deobf_result = DeobfuscationEngine(obf_analysis).deobfuscate(work_dir, class_files)
-            
+
+            # Repack deobfuscated .class files into a JAR so decompilers can consume it
+            repack_jar = Config.TEMP_DIR / 'repack_deobf.jar'
+            with zipfile.ZipFile(repack_jar, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for cf in sorted(deobf_dir.rglob('*.class')):
+                    zf.write(cf, str(cf.relative_to(deobf_dir)))
+            engine_input = repack_jar if repack_jar.stat().st_size > 0 else input_path
+
             output_base = Path(Config.OUTPUT_DIR)
             if output_base.exists(): shutil.rmtree(output_base)
             engine_output = output_base / Config.ENGINE_OUTPUT_DIR
             engine_output.mkdir(parents=True, exist_ok=True)
             
-            engine_results = EngineManager().run_all(deobf_dir, engine_output)
+            engine_results = EngineManager().run_all(engine_input, engine_output)
             best_sources = OutputMerger().merge(engine_results, output_base / Config.MERGED_OUTPUT_DIR)
             IndexGenerator().generate(class_files, engine_results, obf_analysis, deobf_result, best_sources, output_base / Config.INDEX_FILE)
             return True, f"Decompilation complete! {len(best_sources)} classes decompiled."
