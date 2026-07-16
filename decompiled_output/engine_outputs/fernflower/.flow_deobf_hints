@@ -1,0 +1,8 @@
+{
+  "flow_obfuscated_classes": [],
+  "recommended_engines": [
+    "CFR",
+    "Fernflower"
+  ],
+  "aggressive_mode": true
+}

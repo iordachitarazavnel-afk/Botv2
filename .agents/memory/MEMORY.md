@@ -1,0 +1,4 @@
+- [AsmRemapper setup](asm-remapper.md) — bytecode-level renamer using ASM 9.7; compiled in tools/AsmRemapper.jar; needs asm-9.7 + asm-commons-9.7 from libs/jadx-lib/
+- [JADX classpath](jadx-setup.md) — JADX needs -cp with all jars from libs/jadx-lib/, not -jar; main class is jadx.cli.JadxCLI; lib dir has 51 jars
+- [Fernflower input](fernflower-dir.md) — quiltflower (libs/fernflower.jar) needs directory input not JAR; outputs .jar with .java inside that must be extracted
+- [Deobf pipeline](deobf-arch.md) — name_restore always runs; AsmRemapper rewrites actual bytecode (552 classes, 2452 methods, 1625 fields on test JAR); requires ASM 9.7 for Java 21 (major version 65)

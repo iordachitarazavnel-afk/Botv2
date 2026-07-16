@@ -494,6 +494,14 @@ class ClassInfo:
     raw_bytes: Optional[bytes] = None
     constant_pool: Optional[list] = None
     access_flags: int = 0
+    # name → list of descriptors (one per overload)
+    method_descriptors: Dict[str, List[str]] = field(default_factory=dict)
+    # name → descriptor string
+    field_descriptors: Dict[str, str] = field(default_factory=dict)
+    # "name+desc" → access flags int
+    method_access: Dict[str, int] = field(default_factory=dict)
+    # name → access flags int
+    field_access: Dict[str, int] = field(default_factory=dict)
 
 @dataclass
 class ModuleInfo:
@@ -630,6 +638,8 @@ class ClassFileParser:
         fields_count = int.from_bytes(data[offset:offset+2], 'big')
         offset += 2
         fields = []
+        _field_descriptors = {}
+        _field_access_flags = {}
         for _ in range(fields_count):
             f_access = int.from_bytes(data[offset:offset+2], 'big')
             offset += 2
@@ -642,12 +652,17 @@ class ClassFileParser:
             for _ in range(f_attrs_count):
                 offset = ClassFileParser._skip_attribute(data, offset)
             f_name = ClassFileParser._get_utf8(constant_pool, f_name_idx)
+            f_desc = ClassFileParser._get_utf8(constant_pool, f_desc_idx)
             if f_name and not f_name.startswith('this$'):
                 fields.append(f_name)
+                if f_desc: _field_descriptors[f_name] = f_desc
+                _field_access_flags[f_name] = f_access
 
         methods_count = int.from_bytes(data[offset:offset+2], 'big')
         offset += 2
         methods = []
+        _method_descriptors = {}
+        _method_access_map = {}
         has_synthetic_method = False
         string_refs = []
         obf_markers = []
@@ -669,8 +684,12 @@ class ClassFileParser:
                 has_synthetic_method = True
 
             m_name = ClassFileParser._get_utf8(constant_pool, m_name_idx)
+            m_desc = ClassFileParser._get_utf8(constant_pool, m_desc_idx)
             if m_name:
                 methods.append(m_name)
+                if m_desc:
+                    _method_descriptors.setdefault(m_name, []).append(m_desc)
+                    _method_access_map[f"{m_name}{m_desc}"] = m_access
                 for obf_name, obf_config in ObfuscatorRegistry.OBFUSCATORS.items():
                     sigs = obf_config.get("signatures", {})
                     for key, patterns in sigs.items():
@@ -779,6 +798,10 @@ class ClassFileParser:
             raw_bytes=data,
             constant_pool=constant_pool,
             access_flags=access_flags,
+            method_descriptors=_method_descriptors,
+            field_descriptors=_field_descriptors,
+            method_access=_method_access_map,
+            field_access=_field_access_flags,
         )
 
     @staticmethod
@@ -847,73 +870,154 @@ class ClassFileParser:
 
         return {'entries': entries, 'next_offset': offset}
 
+    # Correct JVM opcode → instruction byte-length table (including the opcode byte itself).
+    # Variable-length instructions (tableswitch=0xAA, lookupswitch=0xAB, wide=0xC4) are
+    # handled explicitly in _analyze_bytecode; everything else is looked up here.
+    _OPCODE_SIZE: Dict[int, int] = {
+        # 1-byte instructions
+        **{op: 1 for op in [
+            0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,
+            0x0B,0x0C,0x0D,0x0E,0x0F,
+            0x1A,0x1B,0x1C,0x1D,                   # iload_0..3
+            0x1E,0x1F,0x20,0x21,                   # lload_0..3
+            0x22,0x23,0x24,0x25,                   # fload_0..3
+            0x26,0x27,0x28,0x29,                   # dload_0..3
+            0x2A,0x2B,0x2C,0x2D,                   # aload_0..3
+            0x2E,0x2F,0x30,0x31,0x32,0x33,0x34,0x35,  # *aload
+            0x3B,0x3C,0x3D,0x3E,                   # istore_0..3
+            0x3F,0x40,0x41,0x42,                   # lstore_0..3
+            0x43,0x44,0x45,0x46,                   # fstore_0..3
+            0x47,0x48,0x49,0x4A,                   # dstore_0..3
+            0x4B,0x4C,0x4D,0x4E,                   # astore_0..3
+            0x4F,0x50,0x51,0x52,0x53,0x54,0x55,0x56,  # *astore
+            0x57,0x58,                             # pop, pop2
+            0x59,0x5A,0x5B,0x5C,0x5D,0x5E,0x5F,   # dup*
+            0x60,0x61,0x62,0x63,0x64,0x65,0x66,0x67,  # iadd..dadd
+            0x68,0x69,0x6A,0x6B,0x6C,0x6D,0x6E,0x6F,  # imul..ddiv
+            0x70,0x71,0x72,0x73,0x74,0x75,0x76,0x77,  # irem..dneg
+            0x78,0x79,0x7A,0x7B,0x7C,0x7D,        # ishl..lushr
+            0x7E,0x7F,0x80,0x81,0x82,0x83,        # iand..ixor
+            0x85,0x86,0x87,0x88,0x89,0x8A,0x8B,0x8C,0x8D,0x8E,  # i2l..i2s
+            0x8F,0x90,0x91,0x92,0x93,             # l2i..d2s
+            0x94,0x95,0x96,0x97,0x98,             # lcmp..dcmpg
+            0xAC,0xAD,0xAE,0xAF,0xB0,0xB1,        # *return
+            0xBE,0xBF,                             # arraylength, athrow
+            0xC2,0xC3,                             # monitorenter, monitorexit
+            0xCA,                                  # breakpoint (reserved)
+        ]},
+        # 2-byte instructions
+        **{op: 2 for op in [
+            0x10,                                  # bipush
+            0x12,                                  # ldc
+            0x15,0x16,0x17,0x18,0x19,             # *load
+            0x36,0x37,0x38,0x39,0x3A,             # *store
+            0xA9,                                  # ret
+            0xBC,                                  # newarray
+        ]},
+        # 3-byte instructions
+        **{op: 3 for op in [
+            0x11,                                  # sipush
+            0x13,0x14,                             # ldc_w, ldc2_w
+            0x84,                                  # iinc
+            0x99,0x9A,0x9B,0x9C,0x9D,0x9E,        # if*
+            0x9F,0xA0,0xA1,0xA2,0xA3,0xA4,0xA5,0xA6,  # if_icmp*, if_acmp*
+            0xA7,0xA8,                             # goto, jsr
+            0xB2,0xB3,0xB4,0xB5,                  # getstatic, putstatic, getfield, putfield
+            0xB6,0xB7,0xB8,                        # invokevirtual, invokespecial, invokestatic
+            0xBB,                                  # new
+            0xBD,                                  # anewarray
+            0xC0,0xC1,                             # checkcast, instanceof
+            0xC6,0xC7,                             # ifnull, ifnonnull
+        ]},
+        # 4-byte
+        0xC5: 4,                                   # multianewarray
+        # 5-byte
+        0xB9: 5,                                   # invokeinterface
+        0xBA: 5,                                   # invokedynamic
+        0xC8: 5,                                   # goto_w
+        0xC9: 5,                                   # jsr_w
+    }
+
     @staticmethod
     def _analyze_bytecode(code_bytes: bytes, constant_pool: list) -> dict:
+        """Walk bytecode collecting string LDC references and counting gotos/invokedynamics.
+        Returns partial results on any parse error rather than raising."""
         string_refs = []
         goto_count = 0
         invokedynamic_count = 0
         i = 0
         length = len(code_bytes)
+        _SIZES = ClassFileParser._OPCODE_SIZE
 
-        while i < length:
-            opcode = code_bytes[i]
-            if opcode == 0x12 and i + 1 < length:
-                idx = code_bytes[i + 1]
-                s = ClassFileParser._get_string_value(constant_pool, idx)
-                if s: string_refs.append(s)
-                i += 2
-            elif opcode == 0x13 and i + 2 < length:
-                idx = int.from_bytes(code_bytes[i+1:i+3], 'big')
-                s = ClassFileParser._get_string_value(constant_pool, idx)
-                if s: string_refs.append(s)
-                i += 3
-            elif opcode == 0xA7:
-                goto_count += 1
-                i += 3
-            elif opcode == 0xC8:
-                goto_count += 1
-                i += 5
-            elif opcode == 0xBA:
-                invokedynamic_count += 1
-                i += 5
-            elif opcode == 0xAA:
-                pad = (4 - ((i + 1) % 4)) % 4
-                switch_start = i + 1 + pad
-                if switch_start + 12 <= length:
-                    low = int.from_bytes(code_bytes[switch_start+4:switch_start+8], 'big', signed=True)
-                    high = int.from_bytes(code_bytes[switch_start+8:switch_start+12], 'big', signed=True)
-                    offset_count = high - low + 1
-                    i = switch_start + 12 + offset_count * 4
-                else: i += 1
-            elif opcode == 0xAB:
-                pad = (4 - ((i + 1) % 4)) % 4
-                switch_start = i + 1 + pad
-                if switch_start + 8 <= length:
-                    npairs = int.from_bytes(code_bytes[switch_start+4:switch_start+8], 'big')
-                    i = switch_start + 8 + npairs * 8
-                else: i += 1
-            elif opcode == 0xC4:
-                if i + 1 < length:
-                    wide_op = code_bytes[i + 1]
-                    if wide_op in (0x84,): i += 6
-                    else: i += 4
-                else: i += 1
-            else:
-                i += ClassFileParser._opcode_length(opcode, i, code_bytes)
+        try:
+            while i < length:
+                opcode = code_bytes[i]
 
-        return {'string_refs': string_refs, 'goto_count': goto_count, 'invokedynamic_count': invokedynamic_count}
+                # ── LDC / LDC_W: collect String constants ─────────────────
+                if opcode == 0x12:   # ldc
+                    if i + 1 < length:
+                        s = ClassFileParser._get_string_value(constant_pool, code_bytes[i+1])
+                        if s: string_refs.append(s)
+                    i += 2
+                elif opcode == 0x13:  # ldc_w
+                    if i + 2 < length:
+                        idx = int.from_bytes(code_bytes[i+1:i+3], 'big')
+                        s = ClassFileParser._get_string_value(constant_pool, idx)
+                        if s: string_refs.append(s)
+                    i += 3
 
-    @staticmethod
-    def _opcode_length(opcode: int, offset: int, code: bytes) -> int:
-        one_byte = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E, 0x6F, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E, 0x7F, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0xAC, 0xAD, 0xAE, 0xAF, 0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xCA, 0xCB, 0xCC}
-        if opcode in one_byte: return 1
-        two_byte = {0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0xA9, 0xC0, 0xC1}
-        if opcode in two_byte: return 2
-        three_byte = {0x84, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xB9, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF, 0xC0, 0xC1}
-        if opcode in three_byte: return 3
-        if opcode == 0xC5: return 4
-        if opcode == 0xBA: return 5
-        return 1
+                # ── Control flow ──────────────────────────────────────────
+                elif opcode in (0xA7, 0xA8, 0xC6, 0xC7,
+                                0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E,
+                                0x9F, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6):
+                    if opcode == 0xA7: goto_count += 1
+                    i += 3
+                elif opcode in (0xC8, 0xC9):
+                    if opcode == 0xC8: goto_count += 1
+                    i += 5
+                elif opcode == 0xBA:
+                    invokedynamic_count += 1
+                    i += 5
+
+                # ── Variable-length: tableswitch ──────────────────────────
+                elif opcode == 0xAA:
+                    pad = (4 - ((i + 1) % 4)) % 4
+                    base = i + 1 + pad
+                    if base + 12 <= length:
+                        low  = int.from_bytes(code_bytes[base+4:base+8],  'big', signed=True)
+                        high = int.from_bytes(code_bytes[base+8:base+12], 'big', signed=True)
+                        count = max(0, high - low + 1)
+                        i = base + 12 + count * 4
+                    else:
+                        i = length  # bail out safely
+
+                # ── Variable-length: lookupswitch ─────────────────────────
+                elif opcode == 0xAB:
+                    pad = (4 - ((i + 1) % 4)) % 4
+                    base = i + 1 + pad
+                    if base + 8 <= length:
+                        npairs = int.from_bytes(code_bytes[base+4:base+8], 'big')
+                        i = base + 8 + npairs * 8
+                    else:
+                        i = length
+
+                # ── wide prefix ───────────────────────────────────────────
+                elif opcode == 0xC4:
+                    if i + 1 < length:
+                        wide_op = code_bytes[i + 1]
+                        i += 6 if wide_op == 0x84 else 4  # iinc wide=6, others=4
+                    else:
+                        i += 1
+
+                # ── Everything else: use the size table ───────────────────
+                else:
+                    i += _SIZES.get(opcode, 1)
+
+        except Exception:
+            pass  # return whatever we collected up to the error
+
+        return {'string_refs': string_refs, 'goto_count': goto_count,
+                'invokedynamic_count': invokedynamic_count}
 
     @staticmethod
     def _get_utf8(entries: list, index: int) -> Optional[str]:
@@ -1146,7 +1250,8 @@ class DeobfuscationEngine:
 
         if self.analysis.encrypted_strings_detected: strategies_to_run.add("string_decrypt")
         if self.analysis.junk_code_detected: strategies_to_run.add("junk_remove")
-        if self.analysis.renamed_classes: strategies_to_run.add("name_restore")
+        # Always try name restoration — bytecode-level renamer is safe even if not obfuscated
+        strategies_to_run.add("name_restore")
         if self.analysis.control_flow_obfuscation: strategies_to_run.add("flow_unwind")
         if self.analysis.number_obfuscation: strategies_to_run.add("number_deobf")
         if self.analysis.attribute_manipulation: strategies_to_run.add("attr_repair")
@@ -1218,63 +1323,70 @@ class DeobfuscationEngine:
         except Exception as e:
             logger.error(f"  Threadtear execution error: {e}")
 
+    # ── StringDecryptor tool paths ────────────────────────────────────────────
+    _SD_JAR = Path("tools/StringDecryptor.jar")
+    _SD_CP  = "libs/jadx-lib/asm-9.7.jar:tools/StringDecryptor.jar"
+    _SP_JAR = Path("tools/AsmStringPatcher.jar")   # patched-in below if present
+
     def _decrypt_strings(self, deobf_dir: Path, class_infos: List[ClassInfo]):
-        logger.info("Pass: String decryption")
-        decryptor_classes = []
-        xor_keys = set()
-        base64_patterns = set()
+        """Run StringDecryptor.jar (ASM visitor) to detect & decrypt XOR-obfuscated
+        static String fields, then patch the bytecode with AsmStringPatcher."""
+        logger.info("Pass: String decryption (XOR/brute-force via StringDecryptor)")
 
-        for info in class_infos:
-            is_decryptor = False
-            for method in info.methods:
-                if any(kw in method.lower() for kw in ['decrypt', 'decode', 'z', '_z', '$z']):
-                    is_decryptor = True
-                    break
-            if len(info.methods) <= 3 and len(info.string_refs) > 20: is_decryptor = True
-            for marker in info.obf_markers:
-                if 'string' in marker.lower() or 'decrypt' in marker.lower(): is_decryptor = True
+        if not self._SD_JAR.exists():
+            logger.warning("  StringDecryptor.jar not found — skipping")
+            return
 
-            if is_decryptor:
-                decryptor_classes.append(info)
-                if info.constant_pool:
-                    for entry in info.constant_pool:
-                        if entry and entry[0] == 'Integer': xor_keys.add(entry[1])
-                        elif entry and entry[0] == 'Utf8':
-                            val = entry[1]
-                            if len(val) > 8 and re.match(r'^[A-Za-z0-9+/=]+$', val): base64_patterns.add(val)
+        try:
+            proc = subprocess.run(
+                ["java", "-cp", self._SD_CP, "StringDecryptor", str(deobf_dir)],
+                capture_output=True, text=True, timeout=120
+            )
+            output = proc.stdout.strip()
+            lines = [l for l in output.splitlines() if l.startswith("FIELD ")]
+            # Parse: FIELD owner/Name fieldName decryptedValue
+            decryptions: Dict[str, Dict[str, str]] = defaultdict(dict)  # owner → {field → value}
+            for line in lines:
+                parts = line.split(" ", 3)
+                if len(parts) == 4:
+                    _, owner, fname, value = parts
+                    decryptions[owner][fname] = value.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
 
-            if info.constant_pool and info.string_refs:
-                for s in info.string_refs:
-                    for key in range(1, 256):
-                        try:
-                            decrypted = bytes(b ^ key for b in s.encode('utf-8', errors='replace'))
-                            decoded = decrypted.decode('utf-8', errors='ignore')
-                            if self._is_printable_string(decoded) and len(decoded) > 2:
-                                if decoded != s: self.result.strings_decrypted += 1
-                        except: pass
+            count = sum(len(v) for v in decryptions.values())
+            logger.info(f"  StringDecryptor: {count} strings decrypted")
 
-        import base64
-        for b64str in list(base64_patterns)[:100]:
-            try:
-                decoded = base64.b64decode(b64str)
-                if self._is_printable_bytes(decoded): self.result.strings_decrypted += 1
-            except: pass
+            # Write a string patch file that AsmStringPatcher can consume
+            if count > 0:
+                patch_path = deobf_dir.parent / "string_patches.txt"
+                patch_lines = []
+                for owner, fields in decryptions.items():
+                    for fname, val in fields.items():
+                        safe = val.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
+                        patch_lines.append(f"STRING {owner} {fname} {safe}")
+                patch_path.write_text("\n".join(patch_lines))
 
-        for dc in decryptor_classes:
-            dc_path = Path(dc.source_path) if dc.source_path else None
-            if dc_path and dc_path.exists():
-                marker = deobf_dir / f".string_decryptor_{dc.simple_name}"
-                marker.write_text(f"class={dc.full_name}\nmethods={','.join(dc.methods)}\n")
+                # Run AsmStringPatcher if available
+                if self._SP_JAR.exists():
+                    sp_cp = f"libs/jadx-lib/asm-9.7.jar:tools/AsmStringPatcher.jar"
+                    proc2 = subprocess.run(
+                        ["java", "-cp", sp_cp, "AsmStringPatcher",
+                         str(patch_path), str(deobf_dir), str(deobf_dir)],
+                        capture_output=True, text=True, timeout=120
+                    )
+                    logger.info(f"  AsmStringPatcher: {proc2.stdout.strip()}")
+                else:
+                    logger.info("  AsmStringPatcher.jar not found — strings logged only")
 
-        hints_file = deobf_dir / ".deobf_hints"
-        hints = {
-            "string_decryption": True,
-            "decryptor_classes": [dc.full_name for dc in decryptor_classes],
-            "xor_keys_found": list(xor_keys)[:20],
-            "base64_strings_found": len(base64_patterns),
-        }
-        hints_file.write_text(json.dumps(hints, indent=2))
-        logger.info(f"  Found {len(decryptor_classes)} decryptor classes, decrypted {self.result.strings_decrypted} strings")
+            self.result.strings_decrypted = count
+            # Log progress line from StringDecryptor
+            for l in proc.stdout.splitlines():
+                if l.startswith("[StringDecryptor]"):
+                    logger.info(f"  {l}")
+
+        except subprocess.TimeoutExpired:
+            logger.warning("  StringDecryptor timed out")
+        except Exception as e:
+            logger.warning(f"  StringDecryptor error: {e}")
 
     def _is_printable_string(self, s: str) -> bool:
         if not s: return False
@@ -1289,162 +1401,464 @@ class DeobfuscationEngine:
         except: return False
 
     def _remove_junk_code(self, deobf_dir: Path, class_infos: List[ClassInfo]):
-        logger.info("Pass: Junk code removal")
-        all_method_refs = set()
-        all_class_refs = set()
-
+        """Log suspected junk patterns but NEVER delete class files — false positives destroy output."""
+        logger.info("Pass: Junk code detection (non-destructive)")
+        junk_methods_flagged = 0
         for info in class_infos:
-            if info.constant_pool:
-                for entry in info.constant_pool:
-                    if entry and entry[0] == 'Ref':
-                        class_name = ClassFileParser._get_class_name(info.constant_pool, entry[1])
-                        if 0 < entry[2] < len(info.constant_pool) and info.constant_pool[entry[2]]:
-                            nat_entry = info.constant_pool[entry[2]]
-                            if nat_entry[0] == 'NameAndType':
-                                nat_name = ClassFileParser._get_utf8(info.constant_pool, nat_entry[1])
-                                if nat_name: all_method_refs.add(f"{class_name}.{nat_name}")
-                        if class_name: all_class_refs.add(class_name.replace('/', '.'))
-
-        junk_methods_removed = 0
-        junk_classes_removed = 0
-
-        for info in class_infos:
-            path = Path(info.source_path) if info.source_path else None
-            if not path or not path.exists(): continue
-
-            junk_methods = []
             for method in info.methods:
-                is_junk = False
                 for obf_config in ObfuscatorRegistry.OBFUSCATORS.values():
                     for pattern in obf_config.get("signatures", {}).get("junk_patterns", []):
-                        if re.search(pattern, method, re.IGNORECASE):
-                            is_junk = True
-                            break
-                    if is_junk: break
+                        try:
+                            if re.search(pattern, method, re.IGNORECASE):
+                                junk_methods_flagged += 1
+                        except re.error:
+                            pass
+        self.result.junk_methods_removed = 0
+        logger.info(f"  Flagged {junk_methods_flagged} potential junk methods (not removed)")
 
-                method_ref = f"{info.full_name.replace('.', '/')}.{method}"
-                if method not in ['<init>', '<clinit>', 'main'] and method_ref not in all_method_refs:
-                    if info.has_synthetic or re.match(r'^[a-zA-Z]{1,2}\d*$', method): is_junk = True
+    # ── obfuscated name patterns ────────────────────────────────────────────
+    # Class names: 1-5 chars all-alpha/digit, underscore-numeric, pure digits,
+    # OR names like "DataB" / "LoadE" (word + single uppercase letter suffix)
+    _OBF_CLASS  = re.compile(
+        r'^[a-zA-Z]{1,5}\d*$'          # a, ab, abc, abcd, abcde, a1, ab12
+        r'|^_\d+$'                       # _123
+        r'|^\d+$'                        # 1234 (fully numeric)
+        r'|^[a-zA-Z]{2,8}[A-Z]$'         # DataB, LoadE, SyncF, CalcC (word + 1 uppercase)
+        r'|^[a-zA-Z]_[a-zA-Z\d]{0,3}$'  # a_b, a_12
+    )
+    _OBF_MEMBER = re.compile(r'^[a-zA-Z\d_]{1,3}$')  # 1-3 char method/field names
 
-                if is_junk: junk_methods.append(method)
+    _SKIP_SUPER  = {'Object', 'Enum', 'Thread', 'Runnable', 'Throwable', 'Exception',
+                    'RuntimeException', 'AbstractList', 'AbstractMap', 'AbstractSet'}
+    _SKIP_IFACE  = {'Serializable', 'Cloneable', 'Comparable', 'Iterable'}
 
-            if junk_methods:
-                junk_methods_removed += len(junk_methods)
-                marker = deobf_dir / f".junk_methods_{info.simple_name}"
-                marker.write_text(f"class={info.full_name}\njunk_methods={','.join(junk_methods)}\n")
-
-        for info in class_infos:
-            if info.simple_name in ['Main', 'App', 'Application', 'Entry', 'Start']: continue
-            if info.full_name in all_class_refs: continue
-            if any(kw in info.simple_name.lower() for kw in ['util', 'helper', 'config', 'main']): continue
-            if len(info.methods) <= 2 and len(info.fields) <= 2:
-                path = Path(info.source_path) if info.source_path else None
-                if path and path.exists():
-                    path.unlink()
-                    junk_classes_removed += 1
-                    logger.debug(f"  Removed junk class: {info.full_name}")
-
-        self.result.junk_methods_removed = junk_methods_removed
-        logger.info(f"  Removed {junk_methods_removed} junk methods, {junk_classes_removed} junk classes")
+    # Maps JVM descriptor prefix → human readable base name for fields/methods
+    _DESC_NAMES = {
+        'I': 'intValue', 'J': 'longValue', 'F': 'floatValue', 'D': 'doubleValue',
+        'Z': 'boolFlag', 'B': 'byteValue', 'S': 'shortValue', 'C': 'charValue',
+        'Ljava/lang/String;': 'strValue', 'Ljava/lang/Object;': 'objValue',
+        'Ljava/util/List;': 'list', 'Ljava/util/Map;': 'map', 'Ljava/util/Set;': 'set',
+        '[B': 'byteArr', '[I': 'intArr', '[Ljava/lang/String;': 'strArr',
+    }
 
     def _restore_names(self, deobf_dir: Path, class_infos: List[ClassInfo]):
-        logger.info("Pass: Name restoration")
+        """Full bytecode-level rename via AsmRemapper.  Also falls back to
+        ProGuard mapping if one is embedded in the JAR."""
+        logger.info("Pass: Name restoration (bytecode level)")
+
         if self.analysis.mapping_file_found and self.analysis.mapping_file_path:
             self._apply_proguard_mapping(deobf_dir, Path(self.analysis.mapping_file_path))
-            return
 
-        rename_map = {}
-        counter = defaultdict(int)
-        inheritance_map = defaultdict(list)
-        for info in class_infos:
-            if info.superclass: inheritance_map[info.superclass].append(info)
+        # --- Build name mapping -------------------------------------------
+        # class_map: internal_old → internal_new  (e.g. com/a/A → com/deobf/NetworkHandler)
+        class_map: Dict[str, str] = {}
+        # method_map: (internal_owner, name, desc) → new_name
+        method_map: Dict[tuple, str] = {}
+        # field_map:  (internal_owner, name, desc) → new_name
+        field_map:  Dict[tuple, str] = {}
 
-        interface_map = defaultdict(list)
-        for info in class_infos:
-            for iface in info.interfaces: interface_map[iface].append(info)
+        used_class_names: set = set()
+        used_member_names: Dict[str, set] = defaultdict(set)  # owner → {name}
+        class_counters: Dict[str, int] = defaultdict(int)
 
+        # Build quick-lookup sets of ALL names in the jar (to avoid conflicts)
+        all_internal = set(i.full_name.replace('.', '/') for i in class_infos)
+
+        # ── Package path mapping (full obfuscated path → readable path) ──────
+        # Each unique FULL package path maps to a unique readable path.
+        # Single-letter segments get counter-based replacement (sub1, sub2 …)
+        # scoped to the NEW parent path, so different branches don't collide.
+        pkg_path_map: Dict[str, str] = {}   # old_pkg_path → new_pkg_path
+        pkg_counters: Dict[str, int] = {}   # new_parent_path → next counter
+
+        def _is_obf_seg(seg: str) -> bool:
+            return bool(seg) and len(seg) <= 2 and seg.isalpha()
+
+        def deobf_package(pkg_internal: str) -> str:
+            """Walk each segment, using cached intermediate results so that
+            sub-packages get consistent numbers under the right renamed parent."""
+            if not pkg_internal: return pkg_internal
+            if pkg_internal in pkg_path_map: return pkg_path_map[pkg_internal]
+
+            parts = pkg_internal.split('/')
+            current_old  = ''
+            current_new  = []   # new segments accumulated so far
+
+            for seg in parts:
+                next_old = (current_old + '/' + seg) if current_old else seg
+
+                if next_old in pkg_path_map:
+                    # Re-use a previously computed intermediate result
+                    current_new = pkg_path_map[next_old].split('/') if pkg_path_map[next_old] else []
+                elif not _is_obf_seg(seg):
+                    current_new = current_new + [seg]
+                    # Cache the non-obf path so children find it quickly
+                    if next_old not in pkg_path_map:
+                        pkg_path_map[next_old] = '/'.join(current_new)
+                else:
+                    parent_new_key = '/'.join(current_new) if current_new else '__root__'
+                    n = pkg_counters.get(parent_new_key, 0) + 1
+                    pkg_counters[parent_new_key] = n
+                    current_new = current_new + [f"sub{n}"]
+                    pkg_path_map[next_old] = '/'.join(current_new)
+
+                current_old = next_old
+
+            result = '/'.join(current_new)
+            pkg_path_map[pkg_internal] = result
+            return result
+
+        # Pre-populate in sorted order: parent paths always sort before children.
+        all_packages = sorted({
+            info.package.replace('.', '/') if info.package else ''
+            for info in class_infos
+        })
+        for pkg in all_packages:
+            deobf_package(pkg)
+
+        # ── CLASS renaming ────────────────────────────────────────────────
         for info in class_infos:
             simple = info.simple_name
-            if not re.match(r'^[a-zA-Z]{1,3}\d*$', simple) and not re.match(r'^_\d+$', simple): continue
+            pkg_internal = info.package.replace('.', '/') if info.package else ''
+            old_internal = info.full_name.replace('.', '/')
 
-            new_name = None
-            for iface in info.interfaces:
-                iface_simple = iface.rsplit('.', 1)[-1] if '.' in iface else iface
-                if iface_simple not in ['Object', 'Serializable', 'Cloneable']:
-                    if 'Listener' in iface_simple: new_name = f"{iface_simple.replace('Listener', '')}Handler"
-                    elif 'Provider' in iface_simple: new_name = f"{iface_simple.replace('Provider', '')}Impl"
-                    elif 'Factory' in iface_simple: new_name = f"{iface_simple.replace('Factory', '')}Creator"
-                    else: new_name = f"{iface_simple}Impl"
-                    break
+            name_is_obf = (self._OBF_CLASS.match(simple)
+                           and simple not in ('Enum', 'App', 'Main', 'Log', 'Tag', 'Key', 'IO', 'UI'))
+            pkg_is_obf  = any(len(s) <= 2 and s.isalpha()
+                              for s in pkg_internal.split('/') if s)
 
-            if not new_name and info.superclass:
-                super_simple = info.superclass.rsplit('.', 1)[-1] if '.' in info.superclass else info.superclass
-                if super_simple not in ['Object', 'Enum', 'Thread', 'Runnable']: new_name = f"{super_simple}Subclass"
+            if not name_is_obf and not pkg_is_obf:
+                continue
 
-            if not new_name and info.string_refs:
-                for s in info.string_refs[:5]:
-                    if len(s) > 3 and s.replace('_', '').isalpha():
-                        new_name = f"Class_{s[:15].capitalize()}"
-                        break
+            if name_is_obf:
+                new_simple = self._generate_class_name(info)
+            else:
+                new_simple = simple   # keep readable class name, just fix package
 
-            if not new_name:
-                for method in info.methods:
-                    if method in ['main']: new_name = "MainClass"; break
-                    elif 'connect' in method.lower(): new_name = "ConnectionManager"; break
-                    elif 'encrypt' in method.lower() or 'decrypt' in method.lower(): new_name = "CryptoHandler"; break
-                    elif 'send' in method.lower() or 'receive' in method.lower(): new_name = "NetworkHandler"; break
+            new_pkg = deobf_package(pkg_internal)
 
-            if not new_name:
-                prefix = "Deobf"
-                counter[prefix] += 1
-                new_name = f"{prefix}{counter[prefix]}"
+            # Guarantee uniqueness
+            base = new_simple
+            suffix = 0
+            candidate = f"{new_pkg}/{new_simple}" if new_pkg else new_simple
+            while candidate in used_class_names:
+                suffix += 1
+                new_simple = f"{base}_{suffix}"
+                candidate = f"{new_pkg}/{new_simple}" if new_pkg else new_simple
+            used_class_names.add(candidate)
 
-            base_name = new_name
-            while new_name in [r[1] for r in rename_map.values()]:
-                counter[base_name] += 1
-                new_name = f"{base_name}_{counter[base_name]}"
+            new_internal = candidate
+            if old_internal != new_internal:
+                class_map[old_internal] = new_internal
 
-            old_full = info.full_name
-            new_full = f"{info.package}.{new_name}" if info.package else new_name
-            rename_map[old_full] = new_full
+        # ── METHOD renaming ───────────────────────────────────────────────
+        SKIP_METHODS = frozenset(('<init>', '<clinit>', 'main', 'run',
+                                   'hashCode', 'equals', 'toString', 'clone',
+                                   'compareTo', 'finalize', 'getClass', 'notify',
+                                   'notifyAll', 'wait', 'values', 'ordinal',
+                                   'name', 'valueOf'))
+        for info in class_infos:
+            owner_internal = info.full_name.replace('.', '/')
+            for mname, descs in info.method_descriptors.items():
+                if mname in SKIP_METHODS:
+                    continue
+                if not self._OBF_MEMBER.match(mname):
+                    continue
+                for desc in descs:
+                    new_mname = self._generate_method_name(
+                        mname, desc, info, used_member_names[owner_internal])
+                    base = new_mname
+                    n = 0
+                    while new_mname in used_member_names[owner_internal]:
+                        n += 1
+                        new_mname = f"{base}_{n}"
+                    used_member_names[owner_internal].add(new_mname)
+                    method_map[(owner_internal, mname, desc)] = new_mname
 
-        for old_name, new_name in rename_map.items():
-            old_path = deobf_dir / (old_name.replace('.', '/') + ".class")
-            new_path = deobf_dir / (new_name.replace('.', '/') + ".class")
-            if old_path.exists():
-                new_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(old_path), str(new_path))
+        # ── FIELD renaming ────────────────────────────────────────────────
+        for info in class_infos:
+            owner_internal = info.full_name.replace('.', '/')
+            for fname, fdesc in info.field_descriptors.items():
+                if not self._OBF_MEMBER.match(fname):
+                    continue
+                new_fname = self._generate_field_name(fname, fdesc,
+                                                       used_member_names[owner_internal])
+                base = new_fname
+                n = 0
+                while new_fname in used_member_names[owner_internal]:
+                    n += 1
+                    new_fname = f"{base}_{n}"
+                used_member_names[owner_internal].add(new_fname)
+                field_map[(owner_internal, fname, fdesc)] = new_fname
 
-        self.result.classes_renamed = len(rename_map)
-        logger.info(f"  Renamed {len(rename_map)} classes")
-
-    def _apply_proguard_mapping(self, deobf_dir: Path, mapping_file: Path):
-        logger.info(f"  Applying ProGuard mapping: {mapping_file}")
-        mappings = {}
-        try:
-            with open(mapping_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith('#'): continue
-                    if ' -> ' in line and ':' in line:
-                        parts = line.split(' -> ')
-                        if len(parts) == 2:
-                            orig = parts[0].strip()
-                            obf = parts[1].rstrip(':').strip()
-                            mappings[obf] = orig
-        except Exception as e:
-            logger.error(f"  Error parsing mapping file: {e}")
+        if not class_map and not method_map and not field_map:
+            logger.info("  No obfuscated names detected — skipping AsmRemapper")
             return
 
-        for old_name, new_name in mappings.items():
-            old_path = deobf_dir / (old_name.replace('.', '/') + ".class")
-            new_path = deobf_dir / (new_name.replace('.', '/') + ".class")
-            if old_path.exists():
-                new_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(old_path), str(new_path))
+        logger.info(f"  Mapping: {len(class_map)} classes, "
+                    f"{len(method_map)} methods, {len(field_map)} fields")
 
-        self.result.classes_renamed = len(mappings)
-        logger.info(f"  Applied {len(mappings)} mapping entries")
+        # --- Write mapping file -------------------------------------------
+        mapping_path = deobf_dir.parent / "asm_mapping.txt"
+        lines = []
+        for old, new in class_map.items():
+            lines.append(f"CLASS {old} {new}")
+        for (owner, name, desc), new_name in method_map.items():
+            lines.append(f"METHOD {owner} {name} {desc} {new_name}")
+        for (owner, name, desc), new_name in field_map.items():
+            lines.append(f"FIELD {owner} {name} {desc} {new_name}")
+        mapping_path.write_text("\n".join(lines))
+
+        # --- Run AsmRemapper ----------------------------------------------
+        asm_cp = "libs/jadx-lib/asm-9.7.jar:libs/jadx-lib/asm-commons-9.7.jar:tools/AsmRemapper.jar"
+        remapped_dir = deobf_dir.parent / "remapped"
+        if remapped_dir.exists(): shutil.rmtree(remapped_dir)
+        remapped_dir.mkdir(parents=True)
+
+        cmd = ["java", "-cp", asm_cp, "AsmRemapper",
+               str(mapping_path), str(deobf_dir), str(remapped_dir)]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            if proc.returncode == 0 or remapped_dir.stat().st_size > 0:
+                logger.info(f"  AsmRemapper output: {proc.stdout.strip()}")
+                # Replace deobf_dir contents with remapped output
+                shutil.rmtree(deobf_dir)
+                shutil.copytree(remapped_dir, deobf_dir)
+                logger.info("  Bytecode remapping applied successfully")
+            else:
+                logger.warning(f"  AsmRemapper failed: {proc.stderr[:300]}")
+        except Exception as e:
+            logger.error(f"  AsmRemapper error: {e}")
+
+        self.result.classes_renamed = len(class_map)
+        logger.info(f"  Renamed {len(class_map)} classes, "
+                    f"{len(method_map)} methods, {len(field_map)} fields")
+
+    def _generate_class_name(self, info: 'ClassInfo') -> str:
+        """Produce a human-readable class name from structural hints."""
+        # 1. Interface implementations
+        for iface in info.interfaces:
+            s = iface.rsplit('/', 1)[-1].rsplit('.', 1)[-1]
+            if s in self._SKIP_IFACE: continue
+            if 'Listener' in s:   return s.replace('Listener', 'Handler')
+            if 'Callback' in s:   return s.replace('Callback', 'Handler')
+            if 'Provider' in s:   return s.replace('Provider', 'Impl')
+            if 'Factory' in s:    return s.replace('Factory', 'Creator')
+            if 'Visitor' in s:    return s.replace('Visitor', 'Walker')
+            if 'Handler' in s:    return f"{s}Impl"
+            if 'Observer' in s:   return f"{s}Impl"
+            return f"{s}Impl"
+
+        # 2. Superclass hint
+        if info.superclass:
+            s = info.superclass.rsplit('/', 1)[-1].rsplit('.', 1)[-1]
+            if s not in self._SKIP_SUPER:
+                if info.is_enum:   return f"{s}Enum"
+                if info.is_abstract: return f"Abstract{s}"
+                return f"{s}Sub"
+
+        # 3. Method-name keywords
+        kw_map = [
+            ('main',       'MainClass'),
+            ('start',      'Launcher'),
+            ('init',       'Initializer'),
+            ('connect',    'ConnectionManager'),
+            ('disconnect', 'ConnectionManager'),
+            ('send',       'NetworkSender'),
+            ('receive',    'NetworkReceiver'),
+            ('encrypt',    'CryptoHelper'),
+            ('decrypt',    'CryptoHelper'),
+            ('hash',       'HashUtil'),
+            ('parse',      'Parser'),
+            ('render',     'Renderer'),
+            ('update',     'Updater'),
+            ('load',       'Loader'),
+            ('save',       'Saver'),
+            ('read',       'Reader'),
+            ('write',      'Writer'),
+            ('log',        'Logger'),
+            ('config',     'Config'),
+            ('util',       'Util'),
+            ('helper',     'Helper'),
+            ('manager',    'Manager'),
+            ('handler',    'Handler'),
+            ('service',    'Service'),
+            ('client',     'Client'),
+            ('server',     'Server'),
+            ('event',      'EventHandler'),
+            ('packet',     'PacketHandler'),
+            ('gui',        'GuiComponent'),
+            ('screen',     'ScreenComponent'),
+            ('data',       'DataHolder'),
+            ('model',      'DataModel'),
+            ('view',       'ViewController'),
+            ('controller', 'Controller'),
+            ('task',       'Task'),
+            ('thread',     'WorkerThread'),
+            ('cache',      'Cache'),
+            ('pool',       'Pool'),
+            ('queue',      'Queue'),
+            ('stack',      'Stack'),
+            ('map',        'MapHelper'),
+            ('list',       'ListHelper'),
+        ]
+        method_names_lc = [m.lower() for m in info.methods]
+        for kw, name in kw_map:
+            if any(kw in m for m in method_names_lc):
+                return name
+
+        # 4. String constant hints
+        for s in info.string_refs[:8]:
+            clean = s.strip()
+            if len(clean) < 4 or not clean.replace('_', '').replace('.', '').isalnum():
+                continue
+            # Use last component of dot-separated strings (like package names)
+            part = clean.rsplit('.', 1)[-1].rsplit('/', 1)[-1]
+            part = re.sub(r'[^a-zA-Z0-9]', '', part)
+            if len(part) >= 3:
+                return f"Class_{part[:20].capitalize()}"
+
+        # 5. Type flags
+        if info.is_enum:       return "EnumClass"
+        if info.is_interface:  return "Interface"
+        if info.is_abstract:   return "AbstractClass"
+        if info.is_annotation: return "Annotation"
+
+        return "DeobfClass"
+
+    def _generate_method_name(self, name: str, desc: str, info: 'ClassInfo',
+                               used: set) -> str:
+        """Produce a human-readable method name from its descriptor and context."""
+        try:
+            params_str, ret = desc.split(')')
+            params_str = params_str[1:]  # strip leading (
+        except ValueError:
+            return f"method_{name}"
+
+        params_count = self._count_params(params_str)
+        ret_name   = self._desc_to_name(ret)
+
+        # ── Parse each param type for richer names ────────────────────────
+        param_types = self._parse_param_types(params_str)
+        first_param = param_types[0] if param_types else ''
+
+        # ── Boolean return (is… / has…) ───────────────────────────────────
+        if ret == 'Z':
+            if params_count == 0: return "isEnabled"
+            if params_count == 1: return f"check{first_param.capitalize()}"
+            return "checkCondition"
+
+        # ── Void return ───────────────────────────────────────────────────
+        if ret == 'V':
+            if params_count == 0: return "execute"
+            if params_count == 1:
+                return f"set{first_param.capitalize()}" if first_param else "process"
+            if params_count == 2:
+                p2 = param_types[1] if len(param_types) > 1 else ''
+                return f"set{first_param.capitalize()}And{p2.capitalize()}" if first_param and p2 else "processArgs"
+            return "processAll"
+
+        # ── Non-void, no params (getter / factory) ────────────────────────
+        if params_count == 0:
+            if ret == 'I': return "getInt"
+            if ret == 'J': return "getLong"
+            if ret == 'F': return "getFloat"
+            if ret == 'D': return "getDouble"
+            if ret == 'B': return "getByte"
+            if ret == 'S': return "getShort"
+            if ret == 'C': return "getChar"
+            if ret.startswith('['):       return f"get{ret_name.capitalize()}Array"
+            if 'String' in ret_name:     return "getString"
+            if 'List' in ret_name:       return "getList"
+            if 'Map' in ret_name:        return "getMap"
+            if 'Set' in ret_name:        return "getSet"
+            if 'Object' in ret_name:     return "getValue"
+            return f"get{ret_name.capitalize()}"
+
+        # ── Non-void, with params ─────────────────────────────────────────
+        if ret.startswith('L') or ret.startswith('['):
+            # returns an object → factory / compute pattern
+            if params_count == 1: return f"compute{ret_name.capitalize()}"
+            return f"create{ret_name.capitalize()}"
+
+        # Arithmetic / transform: same primitive in and out
+        if ret in ('I','J','F','D') and first_param in ('int','long','float','double'):
+            return f"transform{ret_name.capitalize()}"
+
+        return f"method_{ret_name}"
+
+    @staticmethod
+    def _parse_param_types(params_str: str) -> List[str]:
+        """Return a list of human-readable type names for each parameter."""
+        _D2N = {'I':'Int','J':'Long','F':'Float','D':'Double',
+                'Z':'Bool','B':'Byte','S':'Short','C':'Char'}
+        types = []
+        i = 0
+        while i < len(params_str):
+            c = params_str[i]
+            if c in _D2N:
+                types.append(_D2N[c]); i += 1
+            elif c == 'L':
+                end = params_str.find(';', i)
+                if end < 0: break
+                cls = params_str[i+1:end].rsplit('/', 1)[-1]
+                types.append(cls); i = end + 1
+            elif c == '[':
+                # skip array prefix, name the element type
+                i += 1
+                if i < len(params_str) and params_str[i] == 'L':
+                    end = params_str.find(';', i)
+                    if end < 0: break
+                    cls = params_str[i+1:end].rsplit('/', 1)[-1] + 'Arr'
+                    types.append(cls); i = end + 1
+                elif i < len(params_str) and params_str[i] in _D2N:
+                    types.append(_D2N[params_str[i]] + 'Arr'); i += 1
+            else:
+                i += 1
+        return types
+
+    def _generate_field_name(self, name: str, desc: str, used: set) -> str:
+        """Produce a human-readable field name from its descriptor."""
+        n = self._DESC_NAMES.get(desc)
+        if n: return n
+        # Array type
+        if desc.startswith('['):
+            inner = self._desc_to_name(desc.lstrip('['))
+            return f"{inner}Array"
+        # Object type: Lsome/ClassName;
+        if desc.startswith('L') and desc.endswith(';'):
+            cls = desc[1:-1].rsplit('/', 1)[-1]
+            cls = re.sub(r'[^a-zA-Z0-9]', '', cls)
+            if cls:
+                return cls[0].lower() + cls[1:] if cls else 'objField'
+        return "field"
+
+    @staticmethod
+    def _count_params(params_str: str) -> int:
+        count = 0
+        i = 0
+        while i < len(params_str):
+            c = params_str[i]
+            if c in 'IJFDZBS C': count += 1; i += 1
+            elif c == 'L':
+                count += 1
+                while i < len(params_str) and params_str[i] != ';': i += 1
+                i += 1
+            elif c == '[': i += 1
+            else: i += 1
+        return count
+
+    @staticmethod
+    def _desc_to_name(desc: str) -> str:
+        if not desc: return 'value'
+        m = {'I':'int','J':'long','F':'float','D':'double',
+             'Z':'bool','B':'byte','S':'short','C':'char','V':'void'}
+        if desc in m: return m[desc]
+        if desc.startswith('L') and desc.endswith(';'):
+            return desc[1:-1].rsplit('/', 1)[-1].rstrip(';') or 'obj'
+        if desc.startswith('['):
+            return DeobfuscationEngine._desc_to_name(desc[1:]) + 'Arr'
+        return 'value'
 
     def _unwind_flow(self, deobf_dir: Path, class_infos: List[ClassInfo]):
         logger.info("Pass: Flow unwinding")
@@ -1641,10 +2055,32 @@ class CFREngine(DecompilerEngine):
     def decompile(self, input_path: Path, output_dir: Path) -> DecompilationResult:
         if not self.available: return DecompilationResult(self.name, False, None, "JAR not found")
         output_dir.mkdir(parents=True, exist_ok=True)
-        args = [str(input_path), "--outputdir", str(output_dir), "--comments", "false", "--usenametable", "true", "--decodeenumswitch", "true", "--decodelambda", "true", "--decodelambdas", "true", "--removeinnerclasssynthetic", "true", "--silent", "true", "--recovertypeclash", "true", "--recovertypehints", "true", "--forcecondpropagate", "true", "--forcetoplevel", "true", "--trackbytecodes", "true"]
+        args = [
+            str(input_path), "--outputdir", str(output_dir),
+            # clarity flags
+            "--comments",                "false",
+            "--usenametable",            "true",
+            "--silent",                  "true",
+            "--forcetoplevel",           "true",
+            # deobfuscation flags
+            "--decodeenumswitch",        "true",
+            "--decodelambdas",           "true",
+            "--removeinnerclasssynthetic","true",
+            "--recovertypeclash",        "true",
+            "--recovertypehints",        "true",
+            "--forcecondpropagate",      "true",
+            "--stringbuffer",            "true",   # inline StringBuilder chains
+            "--sugarenums",              "true",   # restore enum sugar
+            "--sugarasserts",            "true",
+            "--sugarboxing",             "true",
+            "--decodefinally",           "true",
+            "--tidymonitors",            "true",
+            "--lenient",                 "true",   # tolerate bad bytecode
+            "--showversion",             "false",
+        ]
         retcode, stdout, stderr = self._run_java(args)
-        success = retcode == 0
-        count = len(list(output_dir.rglob("*.java"))) if success else 0
+        success = retcode == 0 or len(list(output_dir.rglob("*.java"))) > 0
+        count = len(list(output_dir.rglob("*.java")))
         return DecompilationResult(self.name, success, str(output_dir) if success else None, stderr if not success else None, count)
 
 class ProcyonEngine(DecompilerEngine):
@@ -1663,30 +2099,68 @@ class ProcyonEngine(DecompilerEngine):
 
 class FernflowerEngine(DecompilerEngine):
     def __init__(self): super().__init__("Fernflower", Config.ENGINES["fernflower"]["jar"])
+    def needs_dir_input(self): return True  # quiltflower works on directories, not JARs
     def decompile(self, input_path: Path, output_dir: Path) -> DecompilationResult:
         if not self.available: return DecompilationResult(self.name, False, None, "JAR not found")
         output_dir.mkdir(parents=True, exist_ok=True)
-        cmd = ["java", "-jar", self.jar_path, str(input_path), str(output_dir), "-hdc=0", "-dgs=1", "-rsy=1", "-rbr=0", "-lit=1", "-nls=1", "-ind=    "]
+        src = input_path if input_path.is_dir() else input_path.parent
+        cmd = [
+            "java", "-jar", self.jar_path,
+            "-hes=0",   # hide empty super-constructors
+            "-hdc=0",   # hide default constructors
+            "-dgs=1",   # decompile generic signatures
+            "-asc=1",   # encode non-ascii as unicode
+            "-bsm=1",   # decompile bootstrap methods (lambdas)
+            "-iec=1",   # include entire class path
+            "-iib=1",   # inline increments in expressions
+            "-log=WARN",
+            str(src), str(output_dir),
+        ]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
             retcode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
         except Exception as e: return DecompilationResult(self.name, False, None, str(e))
-        success = retcode == 0
-        count = len(list(output_dir.rglob("*.java"))) if success else 0
-        return DecompilationResult(self.name, success, str(output_dir) if success else None, stderr if not success else None, count)
+        # quiltflower outputs a .jar with .java inside — extract if needed
+        java_count = len(list(output_dir.rglob("*.java")))
+        for jar_out in list(output_dir.glob("*.jar")):
+            import zipfile as _zf
+            with _zf.ZipFile(jar_out, 'r') as z:
+                for name in z.namelist():
+                    if name.endswith(".java"):
+                        dest = output_dir / name
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        dest.write_bytes(z.read(name))
+            jar_out.unlink()
+        java_count = len(list(output_dir.rglob("*.java")))
+        success = java_count > 0
+        return DecompilationResult(self.name, success, str(output_dir) if success else None, stderr if not success else None, java_count)
 
 class JadxEngine(DecompilerEngine):
-    def __init__(self): super().__init__("JADX", Config.ENGINES["jadx"]["jar"])
+    JADX_LIB_DIR = Path("libs/jadx-lib")
+    def __init__(self):
+        super().__init__("JADX", Config.ENGINES["jadx"]["jar"])
+        self.available = self.JADX_LIB_DIR.exists() and any(self.JADX_LIB_DIR.glob("jadx-cli-*.jar"))
     def decompile(self, input_path: Path, output_dir: Path) -> DecompilationResult:
-        if not self.available: return DecompilationResult(self.name, False, None, "JAR not found")
+        if not self.available: return DecompilationResult(self.name, False, None, "JADX lib not found")
         output_dir.mkdir(parents=True, exist_ok=True)
-        cmd = ["java", "-jar", self.jar_path, "-d", str(output_dir), "--show-bad-code", "--no-imports", "--debug-info", "--deobf", "--escape-unicode", str(input_path)]
+        cp = str(self.JADX_LIB_DIR / "*")
+        cmd = ["java", "-cp", cp, "jadx.cli.JadxCLI",
+               "-d", str(output_dir),
+               "--show-bad-code",          # include methods that fail to decompile
+               "--deobf",                  # JADX built-in deobfuscation
+               "--deobf-min", "2",         # rename identifiers ≥ 2 chars
+               "--deobf-max", "64",
+               "--deobf-use-sourcename",   # use SourceFile attr if present
+               "--no-imports",             # keep FQN, avoids import collisions
+               "--cfg",                    # dump control-flow graph
+               "--raw-cfg",
+               str(input_path)]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
             retcode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
         except Exception as e: return DecompilationResult(self.name, False, None, str(e))
-        success = retcode == 0
-        count = len(list(output_dir.rglob("*.java"))) if success else 0
+        count = len(list(output_dir.rglob("*.java")))
+        success = count > 0
         return DecompilationResult(self.name, success, str(output_dir) if success else None, stderr if not success else None, count)
 
 class KrakatauEngine(DecompilerEngine):
@@ -1711,7 +2185,7 @@ class EngineManager:
     def __init__(self):
         self.engines = [CFREngine(), ProcyonEngine(), FernflowerEngine(), JadxEngine(), KrakatauEngine()]
 
-    def run_all(self, input_path: Path, base_output: Path) -> Dict[str, DecompilationResult]:
+    def run_all(self, input_path: Path, base_output: Path, dir_input: Path = None) -> Dict[str, DecompilationResult]:
         results = {}
         for engine in self.engines:
             if not engine.available:
@@ -1720,7 +2194,10 @@ class EngineManager:
             engine_output = base_output / engine.name.lower()
             if engine_output.exists(): shutil.rmtree(engine_output)
             engine_output.mkdir(parents=True, exist_ok=True)
-            results[engine.name] = engine.decompile(input_path, engine_output)
+            # Engines that need directory input get dir_input, others get JAR
+            src = dir_input if (dir_input and hasattr(engine, "needs_dir_input") and engine.needs_dir_input()) else input_path
+            logger.info(f"Running {engine.name} on {src}")
+            results[engine.name] = engine.decompile(src, engine_output)
         return results
 
     def get_available_engines(self) -> List[str]:
@@ -1820,20 +2297,41 @@ class IndexGenerator:
 # ============================================================================
 
 class DependencyManager:
+    MIN_JAR_SIZE = 50_000  # bytes — anything smaller is likely a 404 page
+    DOWNLOAD_TIMEOUT = 15  # seconds — fail fast rather than block the bot
+
     def ensure_dependencies(self) -> Dict[str, bool]:
         Path("libs").mkdir(exist_ok=True)
         availability = {}
         import urllib.request
         for engine_name, engine_config in Config.ENGINES.items():
             jar_path = Path(engine_config["jar"])
-            if jar_path.exists():
+            if jar_path.exists() and jar_path.stat().st_size >= self.MIN_JAR_SIZE:
                 availability[engine_name] = True
-            else:
-                try:
-                    urllib.request.urlretrieve(engine_config["url"], str(jar_path))
+                continue
+            url = engine_config.get("url", "")
+            if not url:
+                availability[engine_name] = False
+                continue
+            try:
+                tmp = Path(str(jar_path) + ".tmp")
+                logger.info(f"Downloading {engine_name} from {url} ...")
+                # Use urlopen with timeout instead of urlretrieve (which has no timeout)
+                req = urllib.request.Request(url, headers={"User-Agent": "GhostDecompiler/1.0"})
+                with urllib.request.urlopen(req, timeout=self.DOWNLOAD_TIMEOUT) as resp:
+                    tmp.write_bytes(resp.read())
+                if tmp.stat().st_size >= self.MIN_JAR_SIZE:
+                    tmp.rename(jar_path)
                     availability[engine_name] = True
-                except:
+                    logger.info(f"Downloaded {engine_name} OK")
+                else:
+                    tmp.unlink(missing_ok=True)
                     availability[engine_name] = False
+                    logger.warning(f"Skipping {engine_name}: download too small (bad URL?)")
+            except Exception as e:
+                Path(str(jar_path) + ".tmp").unlink(missing_ok=True)
+                availability[engine_name] = False
+                logger.warning(f"Failed to download {engine_name} (timeout={self.DOWNLOAD_TIMEOUT}s): {e}")
         return availability
 
 # ============================================================================
@@ -1869,18 +2367,36 @@ class FileHandler:
 # ============================================================================
 
 class DecompilerBot:
-    def __init__(self, skip_download=False):
-        self.skip_download = skip_download
+    """Synchronous pipeline runner — safe to call from a thread executor."""
 
-    async def run(self, input_path: Path) -> Tuple[bool, str]:
+    def __init__(self, skip_download=False, progress_cb=None):
+        self.skip_download = skip_download
+        self.progress_cb   = progress_cb  # optional callable(stage: str)
+
+    def _progress(self, stage: str):
+        if self.progress_cb:
+            try: self.progress_cb(stage)
+            except Exception: pass
+
+    def run(self, input_path: Path) -> Tuple[bool, str]:
         try:
             if not self.skip_download:
+                self._progress("Checking dependencies…")
                 DependencyManager().ensure_dependencies()
+
+            self._progress("Extracting class files…")
             work_dir, class_files = FileHandler.prepare_input(input_path)
+            logger.info(f"Extracted {len(class_files)} class files from {input_path.name}")
+
+            self._progress(f"Detecting obfuscation in {len(class_files)} classes…")
             obf_analysis = ObfuscationDetector().analyze(class_files, work_dir)
+            logger.info(f"Obfuscators detected: {obf_analysis.detected_obfuscators or ['none']}")
+
+            self._progress("Deobfuscating bytecode (rename → decrypt strings → flow)…")
             deobf_dir, deobf_result = DeobfuscationEngine(obf_analysis).deobfuscate(work_dir, class_files)
 
             # Repack deobfuscated .class files into a JAR so decompilers can consume it
+            self._progress("Repacking deobfuscated classes…")
             repack_jar = Config.TEMP_DIR / 'repack_deobf.jar'
             with zipfile.ZipFile(repack_jar, 'w', zipfile.ZIP_DEFLATED) as zf:
                 for cf in sorted(deobf_dir.rglob('*.class')):
@@ -1891,12 +2407,24 @@ class DecompilerBot:
             if output_base.exists(): shutil.rmtree(output_base)
             engine_output = output_base / Config.ENGINE_OUTPUT_DIR
             engine_output.mkdir(parents=True, exist_ok=True)
-            
-            engine_results = EngineManager().run_all(engine_input, engine_output)
+
+            self._progress("Decompiling with CFR / Procyon / Fernflower / JADX…")
+            engine_results = EngineManager().run_all(engine_input, engine_output, dir_input=deobf_dir)
+
+            self._progress("Merging decompiler outputs…")
             best_sources = OutputMerger().merge(engine_results, output_base / Config.MERGED_OUTPUT_DIR)
-            IndexGenerator().generate(class_files, engine_results, obf_analysis, deobf_result, best_sources, output_base / Config.INDEX_FILE)
-            return True, f"Decompilation complete! {len(best_sources)} classes decompiled."
+            IndexGenerator().generate(class_files, engine_results, obf_analysis, deobf_result,
+                                      best_sources, output_base / Config.INDEX_FILE)
+
+            obf_str  = ", ".join(obf_analysis.detected_obfuscators) if obf_analysis.detected_obfuscators else "unknown"
+            deobf_str = (f"{deobf_result.classes_renamed} classes / "
+                         f"{deobf_result.strings_decrypted} strings decrypted")
+            return True, (f"✅ **Decompilation complete!**\n"
+                          f"• Classes: {len(best_sources)} decompiled\n"
+                          f"• Obfuscator: {obf_str}\n"
+                          f"• Deobfuscated: {deobf_str}")
         except Exception as e:
+            logger.exception("Pipeline error")
             return False, str(e)
 
 # ============================================================================
@@ -1915,38 +2443,93 @@ async def on_ready():
 @bot.command(name="decompile")
 async def decompile_command(ctx, *args):
     if not ctx.message.attachments:
-        await ctx.send("Attach a .jar, .class, or .zip file to decompile!")
+        await ctx.send("❌ Attach a `.jar`, `.class`, or `.zip` file to decompile!")
         return
+
     attachment = ctx.message.attachments[0]
-    if attachment.size > Config.MAX_FILE_SIZE:
-        await ctx.send(f"File too large! Max: {Config.MAX_FILE_SIZE // (1024*1024)}MB")
+    if not any(attachment.filename.lower().endswith(ext) for ext in (".jar", ".class", ".zip")):
+        await ctx.send("❌ Only `.jar`, `.class`, and `.zip` files are supported.")
         return
+    if attachment.size > Config.MAX_FILE_SIZE:
+        await ctx.send(f"❌ File too large! Max: {Config.MAX_FILE_SIZE // (1024*1024)} MB")
+        return
+
     skip_download = "--skip-dl" in args
-    status_msg = await ctx.send(f"Received `{attachment.filename}`. Starting pipeline...")
+
     job_dir = Config.TEMP_DIR / f"job_{ctx.message.id}"
     job_dir.mkdir(parents=True, exist_ok=True)
     input_file = job_dir / attachment.filename
+
+    status_msg = await ctx.send(f"📥 Downloading `{attachment.filename}` ({attachment.size//1024} KB)…")
     await attachment.save(input_file)
-    
-    import concurrent.futures
-    loop = asyncio.get_event_loop()
-    decompiler = DecompilerBot(skip_download=skip_download)
-    
-    with concurrent.futures.ThreadPoolExecutor() as pool:
-        success, message = await loop.run_in_executor(pool, lambda: asyncio.run(decompiler.run(input_file)))
-    
+    logger.info(f"[cmd] decompile: {attachment.filename} ({attachment.size} B) job={ctx.message.id}")
+
+    loop    = asyncio.get_event_loop()
+    result_holder: Dict[str, Any] = {}
+
+    # ── live status updater ────────────────────────────────────────────────
+    _stage: list = ["Starting…"]
+
+    def progress_cb(stage: str):
+        _stage[0] = stage
+        logger.info(f"[pipeline] {stage}")
+
+    async def status_updater():
+        """Edit the status message every 5 s so the user sees progress."""
+        dot = 0
+        dots = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]
+        while True:
+            try:
+                await status_msg.edit(content=f"{dots[dot % 8]} `{attachment.filename}` — {_stage[0]}")
+            except Exception:
+                pass
+            dot += 1
+            await asyncio.sleep(5)
+
+    updater_task = asyncio.ensure_future(status_updater())
+
+    try:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            decompiler = DecompilerBot(skip_download=skip_download, progress_cb=progress_cb)
+            # DecompilerBot.run() is now synchronous — safe to call from executor
+            success, message = await loop.run_in_executor(pool, decompiler.run, input_file)
+    except Exception as exc:
+        success, message = False, str(exc)
+        logger.exception("decompile_command executor error")
+    finally:
+        updater_task.cancel()
+
     if not success:
-        await status_msg.edit(content=f"Failed: {message}")
+        logger.warning(f"[cmd] decompile FAILED: {message}")
+        await status_msg.edit(content=f"❌ Failed: {message}")
+        shutil.rmtree(job_dir, ignore_errors=True)
         return
-    
+
+    # ── zip up the output and send ─────────────────────────────────────────
     output_base = Path(Config.OUTPUT_DIR)
-    zip_path = job_dir / "decompiled_output.zip"
+    zip_path    = job_dir / "decompiled_output.zip"
+    file_count  = 0
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for file in output_base.rglob("*"):
-            if file.is_file(): zf.write(file, str(file.relative_to(output_base)))
-    
-    await ctx.send(content=message, file=discord.File(str(zip_path), filename="decompiled_output.zip"))
-    await status_msg.delete()
+        for file in sorted(output_base.rglob("*")):
+            if file.is_file():
+                zf.write(file, str(file.relative_to(output_base)))
+                file_count += 1
+
+    zip_size = zip_path.stat().st_size
+    logger.info(f"[cmd] decompile OK: {file_count} files in ZIP ({zip_size//1024} KB)")
+
+    if zip_size > 8 * 1024 * 1024:
+        # ZIP too big for Discord — inform user
+        await status_msg.edit(content=f"{message}\n⚠️ Output ZIP is {zip_size//1024//1024} MB (too large for Discord). Split or contact server admin.")
+    else:
+        try:
+            await ctx.send(content=message,
+                           file=discord.File(str(zip_path), filename="decompiled_output.zip"))
+            await status_msg.delete()
+        except discord.HTTPException as e:
+            await status_msg.edit(content=f"{message}\n⚠️ Could not send file: {e}")
+
     shutil.rmtree(job_dir, ignore_errors=True)
 
 @bot.command(name="obfuscators")

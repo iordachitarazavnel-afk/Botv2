@@ -1,0 +1,4 @@
+class=com.target.mod.compat.a.b.d.cm$1
+missing_attributes=InnerClasses,StackMapTable
+is_inner=True
+outer_class=com.target.mod.compat.a.b.d.cm

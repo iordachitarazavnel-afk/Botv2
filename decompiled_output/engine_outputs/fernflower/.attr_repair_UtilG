@@ -1,0 +1,4 @@
+class=com.target.mod.compat.a.a.g.UtilG
+missing_attributes=StackMapTable
+is_inner=False
+outer_class=None
